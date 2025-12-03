@@ -4,6 +4,18 @@ import { NextResponse } from "next/server";
 
 const execAsync = promisify(exec);
 
+// Rate limiting and caching
+const CACHE_TTL_MS = 60000; // 1 minute cache
+const ERROR_BACKOFF_MS = 300000; // 5 minutes backoff after errors
+let cachedData: {
+  notifications: PRNotification[];
+  total: number;
+  timestamp: number;
+} | null = null;
+let lastErrorTime = 0;
+let isFetching = false;
+const pendingRequests: Array<(value: NextResponse) => void> = [];
+
 interface PRNotification {
   title: string;
   reason: string;
@@ -11,6 +23,10 @@ interface PRNotification {
   state?: string;
   html_url?: string;
   repository?: string;
+  number?: number;
+  headRef?: string;
+  closedAt?: string;
+  merged?: boolean;
 }
 
 function log(message: string, data?: unknown) {
@@ -51,11 +67,31 @@ async function getNotificationPRs(): Promise<PRNotification[]> {
 
     for (const line of lines) {
       try {
-        const parsed = JSON.parse(line);
-        notifications.push(parsed);
-      } catch (parseError) {
-        log("Failed to parse notification line:", { line, error: parseError });
-        continue;
+        const notification = JSON.parse(line);
+        // The notification.url is already an API URL, don't double-process
+        const apiUrl = notification.url;
+
+        // Get full PR data in one REST API call
+        const { stdout: prData } = await execAsync(
+          `gh api "${apiUrl}" --jq '{state: .state, html_url: .html_url, repository: .base.repo.full_name, number: .number, headRef: .head.ref, closedAt: .closed_at, merged: .merged}'`
+        );
+
+        const prInfo = JSON.parse(prData.trim());
+
+        notifications.push({
+          title: notification.title,
+          reason: notification.reason,
+          url: apiUrl,
+          state: prInfo.state.toLowerCase(),
+          html_url: prInfo.html_url,
+          repository: prInfo.repository,
+          number: prInfo.number,
+          closedAt: prInfo.closedAt,
+          headRef: prInfo.headRef,
+          merged: prInfo.merged,
+        });
+      } catch (error) {
+        logError("Failed to process notification line", error);
       }
     }
 
@@ -67,62 +103,85 @@ async function getNotificationPRs(): Promise<PRNotification[]> {
   }
 }
 
-async function searchPRs(
+async function searchPRsGraphQL(
   query: string,
   reason: string
 ): Promise<PRNotification[]> {
-  log(`Searching PRs: "${query}" (reason: ${reason})`);
+  log(`Searching PRs with GraphQL: "${query}" (reason: ${reason})`);
   try {
-    const cmd = `gh search prs "${query}" --json title,url,state,repository --limit 100`;
-    const { stdout, stderr } = await execAsync(cmd);
+    const graphqlQuery = `
+      query {
+        search(query: "${query} type:pr", type: ISSUE, first: 100) {
+          nodes {
+            __typename
+            ... on PullRequest {
+              title
+              url
+              state
+              repository {
+                nameWithOwner
+              }
+              number
+              closedAt
+              headRef {
+                name
+              }
+              merged
+            }
+          }
+        }
+      }
+    `;
+
+    const { stdout, stderr } = await execAsync(
+      `gh api graphql -f query='${graphqlQuery}'`
+    );
 
     if (stderr) {
-      log(`Search stderr for "${query}":`, stderr);
+      log(`GraphQL search stderr for "${query}":`, stderr);
     }
 
-    const results = JSON.parse(stdout);
-    const prs = results.map(
-      (pr: {
-        title: string;
-        url: string;
-        state: string;
-        repository: { nameWithOwner: string };
-      }) => ({
-        title: pr.title,
-        reason,
-        url: pr.url
-          .replace("github.com", "api.github.com/repos")
-          .replace("/pull/", "/pulls/"),
-        state: pr.state.toLowerCase(),
-        html_url: pr.url,
-        repository: pr.repository.nameWithOwner,
-      })
-    );
+    const result = JSON.parse(stdout);
+    const prs = result.data.search.nodes
+      .filter(
+        (node: { __typename?: string }) =>
+          node && node.__typename === "PullRequest"
+      )
+      .map(
+        (pr: {
+          title?: string;
+          url?: string;
+          state?: string;
+          repository?: { nameWithOwner?: string };
+          number?: number;
+          closedAt?: string | null;
+          headRef?: { name?: string } | null;
+          merged?: boolean;
+        }) => ({
+          title: pr.title || "Unknown",
+          reason,
+          url: (pr.url || "")
+            .replace("github.com", "api.github.com/repos")
+            .replace("/pull/", "/pulls/"),
+          state: (pr.state || "unknown").toLowerCase(),
+          html_url: pr.url || "",
+          repository: pr.repository?.nameWithOwner || "unknown/unknown",
+          number: pr.number || 0,
+          closedAt: pr.closedAt ?? undefined,
+          headRef: pr.headRef?.name || "unknown",
+          merged: pr.merged || false,
+        })
+      )
+      .filter(
+        (pr: { url: string; repository: string }) =>
+          pr.url && pr.repository !== "unknown/unknown"
+      );
 
-    log(`Search "${query}" returned ${prs.length} PRs`);
+    log(`GraphQL search "${query}" returned ${prs.length} PRs`);
     return prs;
   } catch (error) {
-    logError(`Failed to search PRs for "${query}"`, error);
+    logError(`GraphQL search failed for "${query}"`, error);
     return [];
-  }
-}
-
-async function enrichNotification(
-  notification: PRNotification
-): Promise<PRNotification> {
-  if (notification.state && notification.html_url) {
-    return notification;
-  }
-
-  try {
-    const { stdout: prData } = await execAsync(
-      `gh api "${notification.url}" --jq '{state: .state, html_url: .html_url, repository: .base.repo.full_name}'`
-    );
-    const prInfo = JSON.parse(prData.trim());
-    return { ...notification, ...prInfo };
-  } catch (error) {
-    logError(`Failed to enrich notification: ${notification.title}`, error);
-    return notification;
   }
 }
 
@@ -136,6 +195,44 @@ async function getUsername(): Promise<string> {
 
 export async function GET() {
   log("=== Starting PR fetch ===");
+
+  // Check if we have fresh cached data
+  if (cachedData && Date.now() - cachedData.timestamp < CACHE_TTL_MS) {
+    const cacheAge = Math.floor((Date.now() - cachedData.timestamp) / 1000);
+    log(`=== Serving cached data (${cacheAge}s old) ===`);
+    return NextResponse.json({
+      notifications: cachedData.notifications,
+      total: cachedData.total,
+      cached: true,
+    });
+  }
+
+  // Check if we're in error backoff period
+  if (lastErrorTime && Date.now() - lastErrorTime < ERROR_BACKOFF_MS) {
+    const backoffRemaining = Math.floor(
+      (ERROR_BACKOFF_MS - (Date.now() - lastErrorTime)) / 1000
+    );
+    log(`=== Error backoff active: ${backoffRemaining}s remaining ===`);
+    return NextResponse.json(
+      {
+        error: "Rate limit exceeded. Please try again later.",
+        details: `Backing off for ${backoffRemaining} seconds to avoid further rate limiting.`,
+        backoff: true,
+      },
+      { status: 429 }
+    );
+  }
+
+  // If we're already fetching, wait for the existing request to complete
+  if (isFetching) {
+    log("=== Request deduplication: waiting for existing fetch ===");
+    return new Promise<NextResponse>((resolve) => {
+      pendingRequests.push(resolve);
+    });
+  }
+
+  // Mark as fetching and start the process
+  isFetching = true;
   const startTime = Date.now();
 
   try {
@@ -149,10 +246,10 @@ export async function GET() {
       commentedPRs,
     ] = await Promise.all([
       getNotificationPRs(),
-      searchPRs(`author:${username}`, "author"),
-      searchPRs(`review-requested:${username}`, "review_requested"),
-      searchPRs(`reviewed-by:${username}`, "reviewed"),
-      searchPRs(`commenter:${username}`, "commenter"),
+      searchPRsGraphQL(`author:${username}`, "author"),
+      searchPRsGraphQL(`review-requested:${username}`, "review_requested"),
+      searchPRsGraphQL(`reviewed-by:${username}`, "reviewed"),
+      searchPRsGraphQL(`commenter:${username}`, "commenter"),
     ]);
 
     log("Search results summary:", {
@@ -162,20 +259,10 @@ export async function GET() {
       reviewed: reviewedPRs.length,
       commented: commentedPRs.length,
     });
-
-    log(
-      `Enriching ${Math.min(notificationPRs.length, 100)} notification PRs...`
-    );
-    const enrichedNotifications = await Promise.all(
-      notificationPRs.slice(0, 100).map(enrichNotification)
-    );
-
     const allPRs = new Map<string, PRNotification>();
 
-    for (const pr of enrichedNotifications) {
-      if (pr.html_url) {
-        allPRs.set(pr.html_url, pr);
-      }
+    for (const pr of notificationPRs) {
+      allPRs.set(pr.url, pr);
     }
 
     for (const pr of [
@@ -184,12 +271,14 @@ export async function GET() {
       ...reviewedPRs,
       ...commentedPRs,
     ]) {
-      if (pr.html_url && !allPRs.has(pr.html_url)) {
-        allPRs.set(pr.html_url, pr);
-      }
+      allPRs.set(pr.url, pr);
     }
 
     const notifications = Array.from(allPRs.values());
+
+    log(`Processing ${notifications.length} total PRs...`);
+
+    // No enrichment needed - GraphQL already provides all required data
     const openCount = notifications.filter((n) => n.state === "open").length;
     const closedCount = notifications.filter(
       (n) => n.state === "closed" || n.state === "merged"
@@ -202,18 +291,50 @@ export async function GET() {
       closed: closedCount,
     });
 
-    return NextResponse.json({
+    // Update cache
+    cachedData = {
+      notifications,
+      total: notifications.length,
+      timestamp: Date.now(),
+    };
+
+    const response = NextResponse.json({
       notifications,
       total: notifications.length,
     });
+
+    // Resolve all pending requests with the same response
+    pendingRequests.forEach((resolve) => resolve(response));
+    pendingRequests.length = 0;
+
+    return response;
   } catch (error) {
     logError("Fatal error fetching notifications", error);
-    return NextResponse.json(
+    lastErrorTime = Date.now(); // Set error time for backoff
+
+    // Check if it's a rate limit error
+    const isRateLimitError =
+      error instanceof Error &&
+      (error.message.includes("rate limit exceeded") ||
+        error.message.includes("HTTP 403"));
+
+    const errorResponse = NextResponse.json(
       {
-        error: "Failed to fetch notifications",
+        error: isRateLimitError
+          ? "Rate limit exceeded"
+          : "Failed to fetch notifications",
         details: error instanceof Error ? error.message : "Unknown error",
+        backoff: isRateLimitError,
       },
-      { status: 500 }
+      { status: isRateLimitError ? 429 : 500 }
     );
+
+    // Resolve all pending requests with the error
+    pendingRequests.forEach((resolve) => resolve(errorResponse));
+    pendingRequests.length = 0;
+
+    return errorResponse;
+  } finally {
+    isFetching = false;
   }
 }
