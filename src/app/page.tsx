@@ -9,15 +9,23 @@ interface PRNotification {
   state?: string;
   html_url?: string;
   repository?: string;
+  number?: number;
+  headRef?: string;
+  closedAt?: string;
+  merged?: boolean;
 }
 
 interface APIResponse {
   notifications: PRNotification[];
   total: number;
   error?: string;
+  cached?: boolean;
+  backoff?: boolean;
 }
 
 const POLL_INTERVAL_MS = 60000;
+const CACHE_KEY = "github-pr-notifications-cache";
+const REFRESH_THROTTLE_MS = 60000;
 
 export default function Home() {
   const [notifications, setNotifications] = useState<PRNotification[]>([]);
@@ -27,38 +35,123 @@ export default function Home() {
   const [filter, setFilter] = useState<"all" | "open" | "closed">("open");
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [isPolling, setIsPolling] = useState(true);
+  const [copyToast, setCopyToast] = useState(false);
+  const [isFromCache, setIsFromCache] = useState(false);
+  const [isBackoff, setIsBackoff] = useState(false);
+  const [backoffEndTime, setBackoffEndTime] = useState<number | null>(null);
   const pollTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const backoffTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const isBackoffRef = useRef(false);
 
-  const fetchNotifications = useCallback(async (isInitial = false) => {
-    if (!isInitial) {
-      setRefreshing(true);
-    }
+  const fetchNotifications = useCallback(
+    async (isInitial = false) => {
+      // Skip ENTIRELY if we're in backoff mode - no exceptions
+      if (isBackoffRef.current) {
+        return;
+      }
+
+      // Rate limit: skip if last refresh was less than REFRESH_THROTTLE_MS ago
+      if (!isInitial && lastUpdated) {
+        const timeSinceLastUpdate = Date.now() - lastUpdated.getTime();
+        if (timeSinceLastUpdate < REFRESH_THROTTLE_MS) {
+          return;
+        }
+      }
+
+      if (!isInitial) {
+        setRefreshing(true);
+      }
+
+      try {
+        const response = await fetch("/api/notifications");
+        const data: APIResponse = await response.json();
+
+        if (data.error) {
+          setError(data.error);
+          setIsBackoff(!!data.backoff);
+
+          // Set backoff end time if this is a rate limit error
+          if (data.backoff) {
+            const backoffEnd = Date.now() + 300000; // 5 minutes from now
+            setBackoffEndTime(backoffEnd);
+
+            // Clear any existing backoff timeout
+            if (backoffTimeoutRef.current) {
+              clearTimeout(backoffTimeoutRef.current);
+            }
+
+            // Set timeout to automatically clear backoff after 5 minutes
+            backoffTimeoutRef.current = setTimeout(() => {
+              setIsBackoff(false);
+              setBackoffEndTime(null);
+              setError(null);
+            }, 300000);
+          }
+        } else {
+          const now = new Date();
+          setNotifications(data.notifications);
+          // Only update lastUpdated for fresh data, not cached responses
+          if (!data.cached) {
+            setLastUpdated(now);
+          }
+          setIsFromCache(!!data.cached);
+          setIsBackoff(false);
+          setBackoffEndTime(null);
+          setError(null);
+
+          try {
+            window.localStorage.setItem(
+              CACHE_KEY,
+              JSON.stringify({
+                notifications: data.notifications,
+                total: data.total,
+                lastUpdated: now.toISOString(),
+              })
+            );
+          } catch {}
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to fetch");
+      } finally {
+        setLoading(false);
+        setRefreshing(false);
+      }
+    },
+    [lastUpdated]
+  );
+
+  useEffect(() => {
+    let hasCache = false;
 
     try {
-      const response = await fetch("/api/notifications");
-      const data: APIResponse = await response.json();
+      const raw = window.localStorage.getItem(CACHE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as {
+          notifications?: PRNotification[];
+          total?: number;
+          lastUpdated?: string;
+        };
 
-      if (data.error) {
-        setError(data.error);
-      } else {
-        setNotifications(data.notifications);
-        setLastUpdated(new Date());
-        setError(null);
+        if (Array.isArray(parsed.notifications)) {
+          setNotifications(parsed.notifications);
+          setLastUpdated(
+            parsed.lastUpdated ? new Date(parsed.lastUpdated) : null
+          );
+          setLoading(false);
+          setError(null);
+          hasCache = true;
+        }
       }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to fetch");
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
+    } catch {}
+
+    // Only fetch if not in backoff mode
+    if (!isBackoffRef.current) {
+      fetchNotifications(!hasCache);
     }
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    fetchNotifications(true);
-  }, [fetchNotifications]);
-
-  useEffect(() => {
-    if (!isPolling) {
+    if (!isPolling || isBackoff) {
       if (pollTimeoutRef.current) {
         clearTimeout(pollTimeoutRef.current);
         pollTimeoutRef.current = null;
@@ -79,7 +172,7 @@ export default function Home() {
         clearTimeout(pollTimeoutRef.current);
       }
     };
-  }, [isPolling, fetchNotifications]);
+  }, [isPolling, isBackoff, fetchNotifications]);
 
   useEffect(() => {
     const handleVisibilityChange = () => {
@@ -87,7 +180,13 @@ export default function Home() {
         setIsPolling(false);
       } else {
         setIsPolling(true);
-        fetchNotifications(false);
+        // Only fetch if it's been more than 30 seconds since last fetch and not in backoff
+        if (
+          !isBackoff &&
+          (!lastUpdated || Date.now() - lastUpdated.getTime() > 30000)
+        ) {
+          fetchNotifications(false);
+        }
       }
     };
 
@@ -95,7 +194,38 @@ export default function Home() {
     return () => {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [fetchNotifications]);
+  }, [fetchNotifications, lastUpdated]);
+
+  // Cleanup backoff timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (backoffTimeoutRef.current) {
+        clearTimeout(backoffTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  // Sync ref with state
+  useEffect(() => {
+    isBackoffRef.current = isBackoff;
+  }, [isBackoff]);
+
+  // Update countdown timer every second during backoff
+  useEffect(() => {
+    if (!isBackoff || !backoffEndTime) return;
+
+    const interval = setInterval(() => {
+      // Force re-render to update countdown
+      const now = Date.now();
+      if (now >= backoffEndTime) {
+        setIsBackoff(false);
+        setBackoffEndTime(null);
+        setError(null);
+      }
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [isBackoff, backoffEndTime]);
 
   const formatLastUpdated = () => {
     if (!lastUpdated) return "";
@@ -106,22 +236,54 @@ export default function Home() {
     return `${minutes} minutes ago`;
   };
 
+  const getBackoffTimeRemaining = () => {
+    if (!backoffEndTime) return null;
+    const remaining = Math.max(0, backoffEndTime - Date.now());
+    const minutes = Math.floor(remaining / 60000);
+    const seconds = Math.floor((remaining % 60000) / 1000);
+    if (minutes > 0) {
+      return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+    }
+    return `${seconds}s`;
+  };
+
+  const isThrottled = () => {
+    if (!lastUpdated) return false;
+    const timeSinceLastUpdate = Date.now() - lastUpdated.getTime();
+    return timeSinceLastUpdate < REFRESH_THROTTLE_MS;
+  };
+
+  const shouldDisableRefresh = () => {
+    return refreshing || isThrottled() || isBackoff;
+  };
+
   const filteredNotifications = notifications.filter((n) => {
     if (filter === "all") return true;
     if (filter === "open") return n.state === "open";
     if (filter === "closed")
-      return n.state === "closed" || n.state === "merged";
+      return n.state === "closed" || n.state === "merged" || n.merged;
     return true;
   });
 
-  const getStateColor = (state?: string) => {
+  const sortedNotifications = [...filteredNotifications];
+
+  if (filter === "closed") {
+    sortedNotifications.sort((a, b) => {
+      const aTime = a.closedAt ? new Date(a.closedAt).getTime() : 0;
+      const bTime = b.closedAt ? new Date(b.closedAt).getTime() : 0;
+      return bTime - aTime;
+    });
+  }
+
+  const getStateColor = (state?: string, merged?: boolean) => {
+    if (merged) {
+      return "bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200";
+    }
     switch (state) {
       case "open":
         return "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200";
       case "closed":
         return "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200";
-      case "merged":
-        return "bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200";
       default:
         return "bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-200";
     }
@@ -159,11 +321,32 @@ export default function Home() {
                   <span>Refreshing...</span>
                 </div>
               )}
+              {isBackoff && !refreshing && (
+                <div className="flex items-center gap-2 text-sm text-orange-600 dark:text-orange-400">
+                  <div className="h-4 w-4 rounded-full border-2 border-orange-600"></div>
+                  <span>
+                    Rate limited (backoff active: {getBackoffTimeRemaining()}{" "}
+                    remaining)
+                  </span>
+                </div>
+              )}
+              {isThrottled() && !refreshing && !isBackoff && (
+                <div className="flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400">
+                  <div className="h-4 w-4 rounded-full border-2 border-gray-400"></div>
+                  <span>Rate limited</span>
+                </div>
+              )}
               <button
                 onClick={() => fetchNotifications(false)}
-                disabled={refreshing}
+                disabled={shouldDisableRefresh()}
                 className="rounded-lg bg-gray-100 p-2 text-gray-600 transition-colors hover:bg-gray-200 disabled:opacity-50 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700"
-                title="Refresh now"
+                title={
+                  isBackoff
+                    ? "Rate limit exceeded. Please wait before trying again."
+                    : isThrottled()
+                    ? "Please wait before refreshing again"
+                    : "Refresh now"
+                }
               >
                 <svg
                   className={`h-5 w-5 ${refreshing ? "animate-spin" : ""}`}
@@ -186,7 +369,17 @@ export default function Home() {
             {lastUpdated && (
               <span className="ml-2 text-sm">
                 · Updated {formatLastUpdated()}
-                {isPolling && " · Auto-refresh on"}
+                {isFromCache && (
+                  <span className="ml-1 text-green-600 dark:text-green-400">
+                    · From cache
+                  </span>
+                )}
+                {isBackoff && (
+                  <span className="ml-1 text-orange-600 dark:text-orange-400">
+                    · Rate limit protection active
+                  </span>
+                )}
+                {!isBackoff && isPolling && " · Auto-refresh on"}
               </span>
             )}
           </p>
@@ -210,7 +403,9 @@ export default function Home() {
                     notifications.filter((n) =>
                       f === "open"
                         ? n.state === "open"
-                        : n.state === "closed" || n.state === "merged"
+                        : n.state === "closed" ||
+                          n.state === "merged" ||
+                          n.merged
                     ).length
                   }
                 </span>
@@ -229,16 +424,34 @@ export default function Home() {
         )}
 
         {error && (
-          <div className="rounded-lg bg-red-50 p-4 text-red-800 dark:bg-red-900/50 dark:text-red-200">
-            <p className="font-medium">Error loading notifications</p>
-            <p className="text-sm">{error}</p>
-            <p className="mt-2 text-sm">
-              Make sure{" "}
-              <code className="rounded bg-red-100 px-1 dark:bg-red-800">
-                gh
-              </code>{" "}
-              CLI is installed and authenticated.
+          <div
+            className={`rounded-lg p-4 ${
+              isBackoff
+                ? "bg-orange-50 text-orange-800 dark:bg-orange-900/50 dark:text-orange-200"
+                : "bg-red-50 text-red-800 dark:bg-red-900/50 dark:text-red-200"
+            }`}
+          >
+            <p className="font-medium">
+              {isBackoff
+                ? "Rate Limit Protection Active"
+                : "Error loading notifications"}
             </p>
+            <p className="text-sm">{error}</p>
+            {isBackoff ? (
+              <p className="mt-2 text-sm">
+                The application is automatically backing off to avoid exceeding
+                GitHub API limits. Please wait a few minutes before trying
+                again.
+              </p>
+            ) : (
+              <p className="mt-2 text-sm">
+                Make sure{" "}
+                <code className="rounded bg-red-100 px-1 dark:bg-red-800">
+                  gh
+                </code>{" "}
+                CLI is installed and authenticated.
+              </p>
+            )}
           </div>
         )}
 
@@ -251,7 +464,7 @@ export default function Home() {
         )}
 
         <div className="space-y-3">
-          {filteredNotifications.map((notification, index) => (
+          {sortedNotifications.map((notification, index) => (
             <a
               key={index}
               href={notification.html_url || "#"}
@@ -262,21 +475,47 @@ export default function Home() {
               <div className="flex items-start justify-between gap-4">
                 <div className="min-w-0 flex-1">
                   <h3 className="truncate font-medium text-gray-900 dark:text-white">
-                    {notification.title}
+                    {notification.number
+                      ? `#${notification.number} ${notification.title}`
+                      : notification.title}
                   </h3>
-                  {notification.repository && (
-                    <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
-                      {notification.repository}
+                  {(notification.repository || notification.headRef) && (
+                    <p className="mt-1 flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400">
+                      {notification.repository && (
+                        <span className="truncate">
+                          {notification.repository}
+                        </span>
+                      )}
+                      {notification.headRef && (
+                        <button
+                          type="button"
+                          onClick={async (event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            await navigator.clipboard.writeText(
+                              notification.headRef ?? ""
+                            );
+                            setCopyToast(true);
+                            setTimeout(() => setCopyToast(false), 2000);
+                          }}
+                          className="cursor-pointer rounded bg-gray-100 px-2 py-0.5 font-mono text-xs text-gray-700 hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-200 dark:hover:bg-gray-600"
+                        >
+                          {notification.headRef}
+                        </button>
+                      )}
                     </p>
                   )}
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
                   <span
                     className={`rounded-full px-2.5 py-0.5 text-xs font-medium ${getStateColor(
-                      notification.state
+                      notification.state,
+                      notification.merged
                     )}`}
                   >
-                    {notification.state || "unknown"}
+                    {notification.merged
+                      ? "merged"
+                      : notification.state || "unknown"}
                   </span>
                   <span className="rounded-full bg-gray-100 px-2.5 py-0.5 text-xs font-medium text-gray-600 dark:bg-gray-700 dark:text-gray-300">
                     {getReasonLabel(notification.reason)}
@@ -294,6 +533,12 @@ export default function Home() {
           </p>
         )}
       </div>
+
+      {copyToast && (
+        <div className="fixed bottom-4 right-4 rounded bg-gray-900 px-3 py-2 text-sm text-white dark:bg-gray-100 dark:text-gray-900">
+          Copied!
+        </div>
+      )}
     </div>
   );
 }
