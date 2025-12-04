@@ -2,6 +2,8 @@
 
 A Next.js application for monitoring GitHub pull requests with Docker-based authentication.
 
+This project was created because the GitHub pull request interface does not show pull requests that you subscribe to. This tool provides a better view of all PRs you're involved with, including those you subscribe to that might be hidden in the standard GitHub interface.
+
 ## Features
 
 - Real-time GitHub pull request monitoring
