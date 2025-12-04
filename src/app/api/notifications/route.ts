@@ -310,13 +310,17 @@ export async function GET() {
     return response;
   } catch (error) {
     logError("Fatal error fetching notifications", error);
-    lastErrorTime = Date.now(); // Set error time for backoff
 
     // Check if it's a rate limit error
     const isRateLimitError =
       error instanceof Error &&
       (error.message.includes("rate limit exceeded") ||
         error.message.includes("HTTP 403"));
+
+    // Only set backoff time for rate limit errors, not auth errors
+    if (isRateLimitError) {
+      lastErrorTime = Date.now();
+    }
 
     const errorResponse = NextResponse.json(
       {

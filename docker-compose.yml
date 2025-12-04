@@ -1,0 +1,25 @@
+version: "3.8"
+
+services:
+  github-pr-app:
+    build: .
+    ports:
+      - "4477:4477"
+    environment:
+      - NODE_ENV=production
+      - PORT=4477
+    volumes:
+      # Persist GitHub CLI authentication across container restarts
+      - gh-config:/home/nextjs/.config/gh
+    restart: unless-stopped
+    # Add health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4477/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  gh-config:
+    driver: local

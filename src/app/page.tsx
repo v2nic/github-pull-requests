@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef } from "react";
+import AuthDialog from "@/components/AuthDialog";
 
 interface PRNotification {
   title: string;
@@ -19,6 +20,7 @@ interface APIResponse {
   notifications: PRNotification[];
   total: number;
   error?: string;
+  details?: string;
   cached?: boolean;
   backoff?: boolean;
 }
@@ -39,9 +41,27 @@ export default function Home() {
   const [isFromCache, setIsFromCache] = useState(false);
   const [isBackoff, setIsBackoff] = useState(false);
   const [backoffEndTime, setBackoffEndTime] = useState<number | null>(null);
+  const [showAuthDialog, setShowAuthDialog] = useState(false);
   const pollTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const backoffTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isBackoffRef = useRef(false);
+
+  // Debug logging for auth dialog state
+  useEffect(() => {
+    console.log("AuthDialog state changed:", showAuthDialog);
+  }, [showAuthDialog]);
+
+  const handleAuthSuccess = useCallback(() => {
+    setShowAuthDialog(false);
+    setError(null);
+    // Immediately fetch notifications after successful authentication
+    fetchNotifications(true);
+  }, []);
+
+  const handleAuthError = useCallback((errorMessage: string) => {
+    setError(errorMessage);
+    setShowAuthDialog(false);
+  }, []);
 
   const fetchNotifications = useCallback(
     async (isInitial = false) => {
@@ -67,8 +87,25 @@ export default function Home() {
         const data: APIResponse = await response.json();
 
         if (data.error) {
+          console.log(
+            "API Error received:",
+            data.error,
+            "Details:",
+            data.details
+          );
           setError(data.error);
           setIsBackoff(!!data.backoff);
+
+          // Check if this is an authentication error (check both error and details)
+          const errorText = `${data.error} ${data.details || ""}`.toLowerCase();
+          if (
+            errorText.includes("not logged in") ||
+            errorText.includes("authentication") ||
+            errorText.includes("gh auth")
+          ) {
+            console.log("Authentication error detected, showing dialog");
+            setShowAuthDialog(true);
+          }
 
           // Set backoff end time if this is a rate limit error
           if (data.backoff) {
@@ -534,10 +571,20 @@ export default function Home() {
         )}
       </div>
 
+      {/* Copy toast */}
       {copyToast && (
         <div className="fixed bottom-4 right-4 rounded bg-gray-900 px-3 py-2 text-sm text-white dark:bg-gray-100 dark:text-gray-900">
           Copied!
         </div>
+      )}
+
+      {showAuthDialog && (
+        <AuthDialog
+          isOpen={showAuthDialog}
+          onClose={() => setShowAuthDialog(false)}
+          onSuccess={handleAuthSuccess}
+          onError={handleAuthError}
+        />
       )}
     </div>
   );
