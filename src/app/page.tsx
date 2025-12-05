@@ -270,8 +270,18 @@ export default function Home() {
     const seconds = Math.floor((Date.now() - lastUpdated.getTime()) / 1000);
     if (seconds < 60) return "just now";
     const minutes = Math.floor(seconds / 60);
-    if (minutes === 1) return "1 minute ago";
-    return `${minutes} minutes ago`;
+    if (minutes < 60) {
+      if (minutes === 1) return "1 minute ago";
+      return `${minutes} minutes ago`;
+    }
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) {
+      if (hours === 1) return "1 hour ago";
+      return `${hours} hours ago`;
+    }
+    const days = Math.floor(hours / 24);
+    if (days === 1) return "1 day ago";
+    return `${days} days ago`;
   };
 
   const getBackoffTimeRemaining = () => {
