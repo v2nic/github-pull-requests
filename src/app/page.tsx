@@ -14,6 +14,7 @@ interface PRNotification {
   headRef?: string;
   closedAt?: string;
   merged?: boolean;
+  reviewDecision?: "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED";
 }
 
 interface APIResponse {
@@ -51,17 +52,17 @@ export default function Home() {
     console.log("AuthDialog state changed:", showAuthDialog);
   }, [showAuthDialog]);
 
-  const handleAuthSuccess = useCallback(() => {
+  const handleAuthSuccess = () => {
     setShowAuthDialog(false);
     setError(null);
     // Immediately fetch notifications after successful authentication
     fetchNotifications(true);
-  }, []);
+  };
 
-  const handleAuthError = useCallback((errorMessage: string) => {
+  const handleAuthError = (errorMessage: string) => {
     setError(errorMessage);
     setShowAuthDialog(false);
-  }, []);
+  };
 
   const fetchNotifications = useCallback(
     async (isInitial = false) => {
@@ -231,7 +232,7 @@ export default function Home() {
     return () => {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [fetchNotifications, lastUpdated]);
+  }, [fetchNotifications, lastUpdated, isBackoff]);
 
   // Cleanup backoff timeout on unmount
   useEffect(() => {
@@ -554,6 +555,15 @@ export default function Home() {
                       ? "merged"
                       : notification.state || "unknown"}
                   </span>
+                  {notification.reviewDecision === "APPROVED" && (
+                    <span
+                      className="flex h-4 w-4 items-center justify-center rounded-full bg-green-500 text-[10px] font-bold text-white"
+                      aria-label="Approved"
+                      title="Approved"
+                    >
+                      ✓
+                    </span>
+                  )}
                   <span className="rounded-full bg-gray-100 px-2.5 py-0.5 text-xs font-medium text-gray-600 dark:bg-gray-700 dark:text-gray-300">
                     {getReasonLabel(notification.reason)}
                   </span>

@@ -1,8 +1,8 @@
 import { NextRequest } from "next/server";
-import { spawn } from "child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
 
 interface AuthProcess {
-  process: any;
+  process: ChildProcessWithoutNullStreams;
   code?: string;
   url?: string;
   completed: boolean;
@@ -130,7 +130,7 @@ function startAuthSession(sessionId: string | null) {
       authProcesses.set(sessionId, authProcess);
 
       // Helper function to send SSE events safely
-      const sendEvent = (type: string, data: any) => {
+      const sendEvent = (type: string, data: unknown) => {
         if (controllerClosed) return;
         try {
           const eventText = `event: ${type}\n`;
@@ -149,7 +149,7 @@ function startAuthSession(sessionId: string | null) {
         controllerClosed = true;
         try {
           controller.close();
-        } catch (e) {
+        } catch {
           console.log("Controller already closed");
         }
       };
@@ -160,7 +160,7 @@ function startAuthSession(sessionId: string | null) {
         // Kill the process if still running
         try {
           ghProcess.kill();
-        } catch (e) {
+        } catch {
           // Process may already be dead
         }
         safeClose();

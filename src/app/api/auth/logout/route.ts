@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { spawn } from "child_process";
 
 export async function POST(): Promise<NextResponse> {
@@ -10,12 +10,7 @@ export async function POST(): Promise<NextResponse> {
         timeout: 10000,
       });
 
-      let stdout = "";
       let stderr = "";
-
-      logoutProcess.stdout.on("data", (data: Buffer) => {
-        stdout += data.toString();
-      });
 
       logoutProcess.stderr.on("data", (data: Buffer) => {
         stderr += data.toString();

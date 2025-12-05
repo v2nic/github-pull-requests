@@ -27,6 +27,7 @@ interface PRNotification {
   headRef?: string;
   closedAt?: string;
   merged?: boolean;
+  reviewDecision?: "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED";
 }
 
 function log(message: string, data?: unknown) {
@@ -118,6 +119,7 @@ async function searchPRsGraphQL(
               title
               url
               state
+              reviewDecision
               repository {
                 nameWithOwner
               }
@@ -152,6 +154,11 @@ async function searchPRsGraphQL(
           title?: string;
           url?: string;
           state?: string;
+          reviewDecision?:
+            | "APPROVED"
+            | "CHANGES_REQUESTED"
+            | "REVIEW_REQUIRED"
+            | null;
           repository?: { nameWithOwner?: string };
           number?: number;
           closedAt?: string | null;
@@ -170,6 +177,12 @@ async function searchPRsGraphQL(
           closedAt: pr.closedAt ?? undefined,
           headRef: pr.headRef?.name || "unknown",
           merged: pr.merged || false,
+          reviewDecision:
+            pr.reviewDecision === "APPROVED" ||
+            pr.reviewDecision === "CHANGES_REQUESTED" ||
+            pr.reviewDecision === "REVIEW_REQUIRED"
+              ? pr.reviewDecision
+              : undefined,
         })
       )
       .filter(

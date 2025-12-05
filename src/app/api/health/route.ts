@@ -1,9 +1,9 @@
 import { NextResponse } from "next/server";
+import { spawn } from "child_process";
 
 export async function GET(): Promise<NextResponse> {
   try {
     // Check if GitHub CLI is available
-    const { spawn } = require("child_process");
 
     return new Promise<NextResponse>((resolve) => {
       const ghProcess = spawn("gh", ["--version"], {
