@@ -56,6 +56,9 @@ Your authentication will persist across container restarts via Docker volumes.
 
 - `NODE_ENV` - Set to `production` for production deployment
 - `PORT` - Application port (default: 4477)
+- `CIRCLECI_TOKEN` - CircleCI personal access token for status checks
+
+CircleCI status indicators (green/orange/red) appear next to each branch and require `CIRCLECI_TOKEN` to be set in your environment (for example, in a local `.env` file or Docker Compose env block). The token must have permission to read pipelines for the referenced GitHub repositories. If the token is missing or invalid, the CircleCI status API returns `401` and the UI shows a gray dot.
 
 ### Docker Volumes
 

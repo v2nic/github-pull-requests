@@ -3,6 +3,34 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import AuthDialog from "@/components/AuthDialog";
 
+type CircleCIStatus = "success" | "failed" | "running" | "unknown";
+
+type CircleCIStatusResponse = {
+  status: CircleCIStatus;
+  pipelineUrl: string;
+  error?: string;
+};
+
+function getCircleciPipelineUrl(repo: string, branch: string) {
+  const searchParams = new URLSearchParams({ branch });
+  return `https://app.circleci.com/pipelines/github/${repo}?${searchParams.toString()}`;
+}
+
+function CircleCIIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 32 32"
+      aria-hidden="true"
+      className={className}
+      fill="currentColor"
+    >
+      <path d="M16 3C8.82 3 3 8.82 3 16s5.82 13 13 13 13-5.82 13-13S23.18 3 16 3Zm0 23.5C10.2 26.5 5.5 21.8 5.5 16S10.2 5.5 16 5.5 26.5 10.2 26.5 16 21.8 26.5 16 26.5Z" />
+      <path d="M16 9.25c-3.73 0-6.75 3.02-6.75 6.75s3.02 6.75 6.75 6.75c2.9 0 5.37-1.83 6.32-4.39.23-.6-.1-1.28-.7-1.5-.6-.23-1.28.1-1.5.7-.63 1.72-2.27 2.94-4.12 2.94-2.45 0-4.45-2-4.45-4.45s2-4.45 4.45-4.45c1.85 0 3.49 1.22 4.12 2.94.22.6.9.93 1.5.7.6-.22.93-.9.7-1.5-.95-2.56-3.42-4.39-6.32-4.39Z" />
+      <path d="M21.8 16c0 1.05-.85 1.9-1.9 1.9s-1.9-.85-1.9-1.9.85-1.9 1.9-1.9 1.9.85 1.9 1.9Z" />
+    </svg>
+  );
+}
+
 interface PRNotification {
   title: string;
   reason: string;
@@ -43,9 +71,13 @@ export default function Home() {
   const [isBackoff, setIsBackoff] = useState(false);
   const [backoffEndTime, setBackoffEndTime] = useState<number | null>(null);
   const [showAuthDialog, setShowAuthDialog] = useState(false);
+  const [circleciStatusByKey, setCircleciStatusByKey] = useState<
+    Record<string, CircleCIStatusResponse>
+  >({});
   const pollTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const backoffTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isBackoffRef = useRef(false);
+  const circleciInFlightRef = useRef<Set<string>>(new Set());
 
   // Debug logging for auth dialog state
   useEffect(() => {
@@ -157,6 +189,85 @@ export default function Home() {
     },
     [lastUpdated]
   );
+
+  useEffect(() => {
+    const validKeys = new Set<string>();
+    for (const n of notifications) {
+      if (!n.repository || !n.headRef) continue;
+      validKeys.add(`${n.repository}#${n.headRef}`);
+    }
+
+    if (validKeys.size === 0) {
+      if (Object.keys(circleciStatusByKey).length === 0) return;
+      setCircleciStatusByKey({});
+      return;
+    }
+
+    setCircleciStatusByKey((prev) => {
+      const next: Record<string, CircleCIStatusResponse> = {};
+      for (const key of validKeys) {
+        if (prev[key]) {
+          next[key] = prev[key];
+        }
+      }
+      if (Object.keys(next).length === Object.keys(prev).length) {
+        return prev;
+      }
+      return next;
+    });
+  }, [notifications, circleciStatusByKey]);
+
+  useEffect(() => {
+    if (loading || error) return;
+
+    const keys = new Set<string>();
+    for (const n of notifications) {
+      if (!n.repository || !n.headRef) continue;
+      keys.add(`${n.repository}#${n.headRef}`);
+    }
+
+    if (keys.size === 0) return;
+
+    const toFetch = Array.from(keys).filter(
+      (k) => !(k in circleciStatusByKey) && !circleciInFlightRef.current.has(k)
+    );
+
+    if (toFetch.length === 0) return;
+
+    for (const key of toFetch) {
+      circleciInFlightRef.current.add(key);
+      const [repo, branch] = key.split("#");
+
+      void fetch(
+        `/api/circleci/status?repo=${encodeURIComponent(
+          repo ?? ""
+        )}&branch=${encodeURIComponent(branch ?? "")}`
+      )
+        .then(async (res) => {
+          if (!res.ok) {
+            throw new Error(`CircleCI request failed with ${res.status}`);
+          }
+          const data = (await res.json()) as CircleCIStatusResponse;
+          setCircleciStatusByKey((prev) => ({
+            ...prev,
+            [key]: data,
+          }));
+        })
+        .catch(() => {
+          setCircleciStatusByKey((prev) => ({
+            ...prev,
+            [key]: {
+              status: "unknown",
+              pipelineUrl: getCircleciPipelineUrl(repo ?? "", branch ?? ""),
+              error: "Failed to fetch CircleCI status",
+            },
+          }));
+        })
+        .finally(() => {
+          circleciInFlightRef.current.delete(key);
+        });
+    }
+  }, [circleciStatusByKey, error, loading, notifications]);
 
   useEffect(() => {
     let hasCache = false;
@@ -549,6 +660,44 @@ export default function Home() {
                           className="cursor-pointer rounded bg-gray-100 px-2 py-0.5 font-mono text-xs text-gray-700 hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-200 dark:hover:bg-gray-600"
                         >
                           {notification.headRef}
+                        </button>
+                      )}
+                      {notification.repository && notification.headRef && (
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            const key = `${notification.repository}#${notification.headRef}`;
+                            const pipelineUrl =
+                              circleciStatusByKey[key]?.pipelineUrl ??
+                              getCircleciPipelineUrl(
+                                notification.repository ?? "",
+                                notification.headRef ?? ""
+                              );
+                            window.open(
+                              pipelineUrl,
+                              "_blank",
+                              "noopener,noreferrer"
+                            );
+                          }}
+                          className="inline-flex items-center gap-1 rounded bg-gray-100 px-1.5 py-0.5 text-gray-700 hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-200 dark:hover:bg-gray-600"
+                          aria-label="Open CircleCI pipeline"
+                          title="Open CircleCI pipeline"
+                        >
+                          <CircleCIIcon className="h-3.5 w-3.5" />
+                          <span
+                            className={`h-2 w-2 rounded-full ${(() => {
+                              const key = `${notification.repository}#${notification.headRef}`;
+                              const status =
+                                circleciStatusByKey[key]?.status ?? "unknown";
+                              if (status === "success") return "bg-green-500";
+                              if (status === "running") return "bg-amber-400";
+                              if (status === "failed") return "bg-red-500";
+                              return "bg-gray-400";
+                            })()}`}
+                            aria-hidden="true"
+                          />
                         </button>
                       )}
                     </p>
