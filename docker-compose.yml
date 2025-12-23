@@ -5,6 +5,8 @@ services:
     build: .
     ports:
       - "4477:4477"
+    env_file:
+      - .env
     environment:
       - NODE_ENV=production
       - PORT=4477
