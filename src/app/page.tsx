@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import AuthDialog from "@/components/AuthDialog";
 
-type CircleCIStatus = "success" | "failed" | "running" | "unknown";
+type CircleCIStatus = "success" | "failed" | "running" | "on_hold" | "unknown";
 
 type CircleCIStatusResponse = {
   status: CircleCIStatus;
@@ -692,6 +692,7 @@ export default function Home() {
                               const status =
                                 circleciStatusByKey[key]?.status ?? "unknown";
                               if (status === "success") return "bg-green-500";
+                              if (status === "on_hold") return "bg-sky-300";
                               if (status === "running") return "bg-amber-400";
                               if (status === "failed") return "bg-red-500";
                               return "bg-gray-400";

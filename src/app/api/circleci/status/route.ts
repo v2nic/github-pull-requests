@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 
-type CircleCIStatus = "success" | "failed" | "running" | "unknown";
+type CircleCIStatus = "success" | "failed" | "running" | "on_hold" | "unknown";
 
 type CircleCIStatusResponse = {
   status: CircleCIStatus;
@@ -58,9 +58,11 @@ function summarizeStatus(workflows: CircleCIWorkflow[]): CircleCIStatus {
     return "failed";
   }
 
-  if (
-    statuses.some((s) => s === "running" || s === "on_hold" || s === "failing")
-  ) {
+  if (statuses.some((s) => s === "on_hold")) {
+    return "on_hold";
+  }
+
+  if (statuses.some((s) => s === "running" || s === "failing")) {
     return "running";
   }
 
