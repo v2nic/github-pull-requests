@@ -15,12 +15,16 @@ This project was created because the GitHub pull request interface does not show
 
 ## Quick Start
 
-### Prerequisites
+You can run this application either with Docker Compose (recommended for production) or locally in development mode.
+
+### Option 1: Docker Compose (Recommended for Production)
+
+#### Prerequisites
 
 - Docker and Docker Compose
 - GitHub account
 
-### Deployment
+#### Deployment
 
 1. Clone the repository:
 
@@ -36,6 +40,62 @@ docker-compose up -d
 ```
 
 3. Access the app at `http://localhost:4477`
+
+### Option 2: Local Development Mode
+
+#### Prerequisites
+
+- Node.js 18+ and npm
+- GitHub CLI installed locally
+- GitHub account
+
+#### Setup and Run
+
+1. Clone the repository:
+
+```bash
+git clone <repository-url>
+cd github-pull-requests
+```
+
+2. Install dependencies:
+
+```bash
+npm install
+```
+
+3. Create a local environment file:
+
+```bash
+cp .env.local.example .env.local
+```
+
+Edit `.env.local` to configure your settings:
+
+- `SOURCE_BASE_PATH`: Path to your local source code directory (default: `/Users/nicolas/Source`)
+- `CIRCLECI_TOKEN`: Optional CircleCI token for status checks
+
+4. Install GitHub CLI locally (if not already installed):
+
+```bash
+# macOS
+brew install gh
+
+# Ubuntu/Debian
+sudo apt install gh
+
+# Or download from https://cli.github.com/
+```
+
+5. Start the development server:
+
+```bash
+npm run dev
+```
+
+6. Access the app at `http://localhost:4477`
+
+> **Note**: When running locally, the worktree functionality will use your local Source directory directly, ensuring worktrees are created in the same location as when running with Docker Compose.
 
 > **Why port 4477?** The port number is a mnemonic for "GHPR" (GitHub Pull Requests) using phone keypad mapping: G=4, H=4, P=7, R=7.
 
@@ -147,29 +207,7 @@ docker-compose logs github-pr-app
 
 ### Local Development
 
-1. Install dependencies:
-
-```bash
-npm install
-```
-
-2. Start development server:
-
-```bash
-npm run dev
-```
-
-3. Install GitHub CLI locally for testing:
-
-```bash
-# macOS
-brew install gh
-
-# Ubuntu/Debian
-sudo apt install gh
-
-# Or download from https://cli.github.com/
-```
+For local development setup, see [Option 2: Local Development Mode](#option-2-local-development-mode) in the Quick Start section.
 
 ### Building
 
@@ -187,29 +225,3 @@ npm start
 ## License
 
 MIT License
-
-## Getting Started
-
-```bash
-npm install
-npm run dev
-```
-
-Open [http://localhost:4477](http://localhost:4477) in your browser.
-
-## Features
-
-- Lists all PR notifications from your GitHub account
-- Filters by state: Open, Closed, or All
-- Shows subscription reason (author, reviewer, mentioned, etc.)
-- Links directly to PRs on GitHub
-
-## How It Works
-
-The backend API route (`/api/notifications`) executes `gh api notifications` to fetch your GitHub notification threads, filters for pull requests, and enriches each with PR state information.
-
-## Tech Stack
-
-- Next.js 16 with App Router
-- TypeScript
-- Tailwind CSS

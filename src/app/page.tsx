@@ -92,7 +92,10 @@ export default function Home() {
     Record<string, CircleCIStatusResponse>
   >({});
   const [worktreeStatusByKey, setWorktreeStatusByKey] = useState<
-    Record<string, { exists: boolean; path: string | null; loading: boolean }>
+    Record<
+      string,
+      { exists: boolean; path: string | null; loading: boolean; error?: string }
+    >
   >({});
   const pollTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const backoffTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -579,7 +582,7 @@ export default function Home() {
   ) => {
     setWorktreeStatusByKey((prev) => ({
       ...prev,
-      [key]: { ...prev[key], loading: true },
+      [key]: { ...prev[key], loading: true, error: undefined },
     }));
 
     try {
@@ -599,14 +602,20 @@ export default function Home() {
         console.error("Failed to create worktree", data.error);
         setWorktreeStatusByKey((prev) => ({
           ...prev,
-          [key]: { ...prev[key], loading: false },
+          [key]: {
+            ...prev[key],
+            loading: false,
+            error: data.error || "Failed to create worktree",
+          },
         }));
       }
     } catch (e) {
       console.error("Failed to create worktree", e);
+      const errorMessage =
+        e instanceof Error ? e.message : "Failed to create worktree";
       setWorktreeStatusByKey((prev) => ({
         ...prev,
-        [key]: { ...prev[key], loading: false },
+        [key]: { ...prev[key], loading: false, error: errorMessage },
       }));
     }
   };
@@ -819,12 +828,95 @@ export default function Home() {
             >
               <div className="flex items-start justify-between gap-4">
                 <div className="min-w-0 flex-1">
-                  <h3 className="truncate font-medium text-gray-900 dark:text-white">
-                    {notification.number
-                      ? `#${notification.number} ${notification.title}`
-                      : notification.title}
-                  </h3>
-                  {(notification.repository || notification.headRef) && (
+                  <div className="flex items-center gap-2">
+                    {notification.repository && notification.headRef && (
+                      <div className="flex items-center">
+                        {(() => {
+                          const key = `${notification.repository}#${notification.headRef}`;
+                          const status = worktreeStatusByKey[key];
+
+                          if (status?.loading) {
+                            return (
+                              <div className="mr-2 h-4 w-4 animate-spin rounded-full border-2 border-gray-400 border-t-transparent" />
+                            );
+                          }
+
+                          if (status?.exists && status.path) {
+                            return (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  // Open in Windsurf
+                                  if (status.path) {
+                                    window.location.href = `windsurf://file/${encodeURIComponent(
+                                      status.path
+                                    )}`;
+                                  }
+                                }}
+                                className="mr-2 text-gray-500 hover:text-blue-600 dark:text-gray-400 dark:hover:text-blue-400 bg-transparent border-none cursor-pointer p-0"
+                                title={`Open worktree at ${status?.path} in Windsurf`}
+                              >
+                                <svg
+                                  xmlns="http://www.w3.org/2000/svg"
+                                  viewBox="0 0 24 24"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  strokeWidth="2"
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                  className="h-4 w-4"
+                                >
+                                  <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 2H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z" />
+                                </svg>
+                              </button>
+                            );
+                          }
+
+                          return (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                handleCreateWorktree(
+                                  notification.repository!,
+                                  notification.headRef!,
+                                  key
+                                );
+                              }}
+                              className="mr-2 text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300"
+                              title={`Create worktree at ${
+                                status?.path || "loading..."
+                              }`}
+                            >
+                              <svg
+                                xmlns="http://www.w3.org/2000/svg"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="2"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                className="h-4 w-4"
+                              >
+                                <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 2H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z" />
+                                <path d="M12 10v6" />
+                                <path d="M9 13h6" />
+                              </svg>
+                            </button>
+                          );
+                        })()}
+                      </div>
+                    )}
+                    <h3 className="truncate font-medium text-gray-900 dark:text-white">
+                      {notification.number
+                        ? `#${notification.number} ${notification.title}`
+                        : notification.title}
+                    </h3>
+                  </div>
+                  {notification.repository && notification.headRef && (
                     <p className="mt-1 flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400">
                       {notification.repository && (
                         <span className="truncate">
@@ -887,6 +979,23 @@ export default function Home() {
                           />
                         </button>
                       )}
+                      {/* Display worktree error if exists */}
+                      {(() => {
+                        const key = `${notification.repository}#${notification.headRef}`;
+                        const status = worktreeStatusByKey[key];
+                        if (
+                          status?.error &&
+                          !status.loading &&
+                          !status.exists
+                        ) {
+                          return (
+                            <span className="text-xs text-red-600 dark:text-red-400">
+                              Error: {status.error}
+                            </span>
+                          );
+                        }
+                        return null;
+                      })()}
                     </p>
                   )}
                 </div>
@@ -913,80 +1022,6 @@ export default function Home() {
                   <span className="rounded-full bg-gray-100 px-2.5 py-0.5 text-xs font-medium text-gray-600 dark:bg-gray-700 dark:text-gray-300">
                     {getReasonLabel(notification.reason)}
                   </span>
-                  {notification.repository && notification.headRef && (
-                    <div className="ml-1 flex items-center">
-                      {(() => {
-                        const key = `${notification.repository}#${notification.headRef}`;
-                        const status = worktreeStatusByKey[key];
-
-                        if (status?.loading) {
-                          return (
-                            <div className="h-4 w-4 animate-spin rounded-full border-2 border-gray-400 border-t-transparent" />
-                          );
-                        }
-
-                        if (status?.exists && status.path) {
-                          return (
-                            <a
-                              href={`windsurf://file/${encodeURIComponent(
-                                status.path
-                              )}`}
-                              className="text-gray-500 hover:text-blue-600 dark:text-gray-400 dark:hover:text-blue-400"
-                              title={`Open worktree at ${status?.path} in Windsurf`}
-                              onClick={(e) => e.stopPropagation()}
-                            >
-                              <svg
-                                xmlns="http://www.w3.org/2000/svg"
-                                viewBox="0 0 24 24"
-                                fill="none"
-                                stroke="currentColor"
-                                strokeWidth="2"
-                                strokeLinecap="round"
-                                strokeLinejoin="round"
-                                className="h-4 w-4"
-                              >
-                                <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 2H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z" />
-                              </svg>
-                            </a>
-                          );
-                        }
-
-                        return (
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.preventDefault();
-                              e.stopPropagation();
-                              handleCreateWorktree(
-                                notification.repository!,
-                                notification.headRef!,
-                                key
-                              );
-                            }}
-                            className="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300"
-                            title={`Create worktree at ${
-                              status?.path || "loading..."
-                            }`}
-                          >
-                            <svg
-                              xmlns="http://www.w3.org/2000/svg"
-                              viewBox="0 0 24 24"
-                              fill="none"
-                              stroke="currentColor"
-                              strokeWidth="2"
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                              className="h-4 w-4"
-                            >
-                              <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 2H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z" />
-                              <path d="M12 10v6" />
-                              <path d="M9 13h6" />
-                            </svg>
-                          </button>
-                        );
-                      })()}
-                    </div>
-                  )}
                 </div>
               </div>
             </a>
