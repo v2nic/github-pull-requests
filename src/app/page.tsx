@@ -52,6 +52,22 @@ interface APIResponse {
   details?: string;
   cached?: boolean;
   backoff?: boolean;
+  ghMetrics?: GhMetrics;
+}
+
+interface GhMetrics {
+  total: number;
+  throttledCount: number;
+  throttledMs: number;
+  byType: {
+    notifications: number;
+    prDetails: number;
+    graphql: number;
+    user: number;
+  };
+  windowSizeMs: number;
+  windowLimit: number;
+  currentWindowCount: number;
 }
 
 const POLL_INTERVAL_MS = 60000;
@@ -71,13 +87,18 @@ export default function Home() {
   const [isBackoff, setIsBackoff] = useState(false);
   const [backoffEndTime, setBackoffEndTime] = useState<number | null>(null);
   const [showAuthDialog, setShowAuthDialog] = useState(false);
+  const [ghMetrics, setGhMetrics] = useState<GhMetrics | null>(null);
   const [circleciStatusByKey, setCircleciStatusByKey] = useState<
     Record<string, CircleCIStatusResponse>
+  >({});
+  const [worktreeStatusByKey, setWorktreeStatusByKey] = useState<
+    Record<string, { exists: boolean; path: string | null; loading: boolean }>
   >({});
   const pollTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const backoffTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isBackoffRef = useRef(false);
   const circleciInFlightRef = useRef<Set<string>>(new Set());
+  const worktreeInFlightRef = useRef<Set<string>>(new Set());
 
   // Debug logging for auth dialog state
   useEffect(() => {
@@ -118,6 +139,10 @@ export default function Home() {
       try {
         const response = await fetch("/api/notifications");
         const data: APIResponse = await response.json();
+
+        if (data.ghMetrics) {
+          setGhMetrics(data.ghMetrics);
+        }
 
         if (data.error) {
           console.log(
@@ -176,6 +201,7 @@ export default function Home() {
                 notifications: data.notifications,
                 total: data.total,
                 lastUpdated: now.toISOString(),
+                ghMetrics: data.ghMetrics,
               })
             );
           } catch {}
@@ -215,7 +241,23 @@ export default function Home() {
       }
       return next;
     });
-  }, [notifications, circleciStatusByKey]);
+
+    setWorktreeStatusByKey((prev) => {
+      const next: Record<
+        string,
+        { exists: boolean; path: string | null; loading: boolean }
+      > = {};
+      for (const key of validKeys) {
+        if (prev[key]) {
+          next[key] = prev[key];
+        }
+      }
+      if (Object.keys(next).length === Object.keys(prev).length) {
+        return prev;
+      }
+      return next;
+    });
+  }, [notifications, circleciStatusByKey, worktreeStatusByKey]);
 
   useEffect(() => {
     if (loading || error) return;
@@ -270,6 +312,58 @@ export default function Home() {
   }, [circleciStatusByKey, error, loading, notifications]);
 
   useEffect(() => {
+    if (loading || error) return;
+
+    const keys = new Set<string>();
+    for (const n of notifications) {
+      if (!n.repository || !n.headRef) continue;
+      keys.add(`${n.repository}#${n.headRef}`);
+    }
+
+    if (keys.size === 0) return;
+
+    const toFetch = Array.from(keys).filter(
+      (k) => !(k in worktreeStatusByKey) && !worktreeInFlightRef.current.has(k)
+    );
+
+    if (toFetch.length === 0) return;
+
+    for (const key of toFetch) {
+      worktreeInFlightRef.current.add(key);
+      const [repo, branch] = key.split("#");
+
+      void fetch(
+        `/api/worktree?repo=${encodeURIComponent(
+          repo ?? ""
+        )}&branch=${encodeURIComponent(branch ?? "")}`
+      )
+        .then(async (res) => {
+          if (!res.ok) {
+            throw new Error(`Worktree request failed with ${res.status}`);
+          }
+          const data = (await res.json()) as { exists: boolean; path: string };
+          setWorktreeStatusByKey((prev) => ({
+            ...prev,
+            [key]: { exists: data.exists, path: data.path, loading: false },
+          }));
+        })
+        .catch(() => {
+          setWorktreeStatusByKey((prev) => ({
+            ...prev,
+            [key]: {
+              exists: false,
+              path: null,
+              loading: false,
+            },
+          }));
+        })
+        .finally(() => {
+          worktreeInFlightRef.current.delete(key);
+        });
+    }
+  }, [worktreeStatusByKey, error, loading, notifications]);
+
+  useEffect(() => {
     let hasCache = false;
 
     try {
@@ -279,6 +373,7 @@ export default function Home() {
           notifications?: PRNotification[];
           total?: number;
           lastUpdated?: string;
+          ghMetrics?: GhMetrics;
         };
 
         if (Array.isArray(parsed.notifications)) {
@@ -286,6 +381,9 @@ export default function Home() {
           setLastUpdated(
             parsed.lastUpdated ? new Date(parsed.lastUpdated) : null
           );
+          if (parsed.ghMetrics) {
+            setGhMetrics(parsed.ghMetrics);
+          }
           setLoading(false);
           setError(null);
           hasCache = true;
@@ -416,6 +514,15 @@ export default function Home() {
     return refreshing || isThrottled() || isBackoff;
   };
 
+  const formatMillis = (ms: number) => {
+    if (ms < 1000) return `${ms}ms`;
+    const seconds = ms / 1000;
+    if (seconds < 60) return `${seconds.toFixed(1)}s`;
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = seconds % 60;
+    return `${minutes}m ${remainingSeconds.toFixed(0)}s`;
+  };
+
   const filteredNotifications = notifications.filter((n) => {
     if (filter === "all") return true;
     if (filter === "open") return n.state === "open";
@@ -463,6 +570,45 @@ export default function Home() {
       reviewed: "Reviewed",
     };
     return labels[reason] || reason;
+  };
+
+  const handleCreateWorktree = async (
+    repo: string,
+    branch: string,
+    key: string
+  ) => {
+    setWorktreeStatusByKey((prev) => ({
+      ...prev,
+      [key]: { ...prev[key], loading: true },
+    }));
+
+    try {
+      const res = await fetch("/api/worktree", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repo, branch }),
+      });
+      const data = await res.json();
+
+      if (data.success) {
+        setWorktreeStatusByKey((prev) => ({
+          ...prev,
+          [key]: { exists: true, path: data.path, loading: false },
+        }));
+      } else {
+        console.error("Failed to create worktree", data.error);
+        setWorktreeStatusByKey((prev) => ({
+          ...prev,
+          [key]: { ...prev[key], loading: false },
+        }));
+      }
+    } catch (e) {
+      console.error("Failed to create worktree", e);
+      setWorktreeStatusByKey((prev) => ({
+        ...prev,
+        [key]: { ...prev[key], loading: false },
+      }));
+    }
   };
 
   return (
@@ -543,6 +689,46 @@ export default function Home() {
             )}
           </p>
         </header>
+
+        {ghMetrics && (
+          <div className="mb-6 grid gap-3 rounded-lg bg-white p-4 text-sm text-gray-800 shadow dark:bg-gray-800 dark:text-gray-200 sm:grid-cols-2">
+            <div>
+              <div className="flex items-center justify-between">
+                <span className="font-medium text-gray-900 dark:text-white">
+                  GitHub requests (last window)
+                </span>
+                <span className="text-xs text-gray-500 dark:text-gray-400">
+                  {ghMetrics.currentWindowCount}/{ghMetrics.windowLimit} in{" "}
+                  {Math.round(ghMetrics.windowSizeMs / 1000)}s
+                </span>
+              </div>
+              <div className="mt-2 flex flex-wrap gap-2">
+                <span className="rounded bg-blue-50 px-2 py-1 text-xs text-blue-800 dark:bg-blue-900/40 dark:text-blue-200">
+                  Total: {ghMetrics.total}
+                </span>
+                <span className="rounded bg-amber-50 px-2 py-1 text-xs text-amber-800 dark:bg-amber-900/40 dark:text-amber-200">
+                  Throttled: {ghMetrics.throttledCount}
+                </span>
+                <span className="rounded bg-amber-50 px-2 py-1 text-xs text-amber-800 dark:bg-amber-900/40 dark:text-amber-200">
+                  Waited: {formatMillis(ghMetrics.throttledMs)}
+                </span>
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+              {Object.entries(ghMetrics.byType).map(([type, count]) => (
+                <div
+                  key={type}
+                  className="rounded bg-gray-50 px-2 py-1 text-center text-xs dark:bg-gray-700"
+                >
+                  <div className="text-gray-500 dark:text-gray-300">{type}</div>
+                  <div className="text-base font-semibold text-gray-900 dark:text-white">
+                    {count}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         <div className="mb-6 flex gap-2">
           {(["all", "open", "closed"] as const).map((f) => (
@@ -727,6 +913,80 @@ export default function Home() {
                   <span className="rounded-full bg-gray-100 px-2.5 py-0.5 text-xs font-medium text-gray-600 dark:bg-gray-700 dark:text-gray-300">
                     {getReasonLabel(notification.reason)}
                   </span>
+                  {notification.repository && notification.headRef && (
+                    <div className="ml-1 flex items-center">
+                      {(() => {
+                        const key = `${notification.repository}#${notification.headRef}`;
+                        const status = worktreeStatusByKey[key];
+
+                        if (status?.loading) {
+                          return (
+                            <div className="h-4 w-4 animate-spin rounded-full border-2 border-gray-400 border-t-transparent" />
+                          );
+                        }
+
+                        if (status?.exists && status.path) {
+                          return (
+                            <a
+                              href={`windsurf://file/${encodeURIComponent(
+                                status.path
+                              )}`}
+                              className="text-gray-500 hover:text-blue-600 dark:text-gray-400 dark:hover:text-blue-400"
+                              title={`Open worktree at ${status?.path} in Windsurf`}
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <svg
+                                xmlns="http://www.w3.org/2000/svg"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="2"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                className="h-4 w-4"
+                              >
+                                <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 2H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z" />
+                              </svg>
+                            </a>
+                          );
+                        }
+
+                        return (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              handleCreateWorktree(
+                                notification.repository!,
+                                notification.headRef!,
+                                key
+                              );
+                            }}
+                            className="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300"
+                            title={`Create worktree at ${
+                              status?.path || "loading..."
+                            }`}
+                          >
+                            <svg
+                              xmlns="http://www.w3.org/2000/svg"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              className="h-4 w-4"
+                            >
+                              <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 2H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z" />
+                              <path d="M12 10v6" />
+                              <path d="M9 13h6" />
+                            </svg>
+                          </button>
+                        );
+                      })()}
+                    </div>
+                  )}
                 </div>
               </div>
             </a>

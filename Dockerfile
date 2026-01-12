@@ -5,6 +5,7 @@ FROM node:20-alpine
 RUN apk add --no-cache \
     curl \
     bash \
+    git \
     && GH_VERSION="2.40.1" \
     && curl -L "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" -o gh.tar.gz \
     && tar xzvf gh.tar.gz \

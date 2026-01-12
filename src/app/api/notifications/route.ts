@@ -7,6 +7,10 @@ const execAsync = promisify(exec);
 // Rate limiting and caching
 const CACHE_TTL_MS = 60000; // 1 minute cache
 const ERROR_BACKOFF_MS = 300000; // 5 minutes backoff after errors
+const RATE_LIMIT_WINDOW_MS = 60000;
+const MAX_GH_CALLS_PER_WINDOW = 20;
+const MIN_SLEEP_MS = 100;
+const SLEEP_STEP_MS = 250;
 let cachedData: {
   notifications: PRNotification[];
   total: number;
@@ -15,6 +19,18 @@ let cachedData: {
 let lastErrorTime = 0;
 let isFetching = false;
 const pendingRequests: Array<(value: NextResponse) => void> = [];
+const ghCallTimestamps: number[] = [];
+const ghMetrics = {
+  total: 0,
+  throttledCount: 0,
+  throttledMs: 0,
+  byType: {
+    notifications: 0,
+    prDetails: 0,
+    graphql: 0,
+    user: 0,
+  },
+};
 
 interface PRNotification {
   title: string;
@@ -52,10 +68,78 @@ function logError(message: string, error: unknown) {
   }
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function pruneGhCallWindow(now: number) {
+  while (
+    ghCallTimestamps.length &&
+    now - ghCallTimestamps[0] >= RATE_LIMIT_WINDOW_MS
+  ) {
+    ghCallTimestamps.shift();
+  }
+}
+
+async function waitForGhSlot() {
+  let waited = 0;
+  while (true) {
+    const now = Date.now();
+    pruneGhCallWindow(now);
+    if (ghCallTimestamps.length < MAX_GH_CALLS_PER_WINDOW) {
+      ghCallTimestamps.push(now);
+      return waited;
+    }
+    const untilReset = RATE_LIMIT_WINDOW_MS - (now - ghCallTimestamps[0]);
+    const sleepFor = Math.max(
+      MIN_SLEEP_MS,
+      Math.min(SLEEP_STEP_MS, untilReset)
+    );
+    await sleep(sleepFor);
+    waited += sleepFor;
+  }
+}
+
+function recordGhCall(
+  type: keyof typeof ghMetrics.byType,
+  throttledMs: number
+) {
+  ghMetrics.total += 1;
+  ghMetrics.byType[type] += 1;
+  if (throttledMs > 0) {
+    ghMetrics.throttledCount += 1;
+    ghMetrics.throttledMs += throttledMs;
+  }
+}
+
+async function runGhCommand(
+  type: keyof typeof ghMetrics.byType,
+  command: string
+): Promise<{ stdout: string; stderr: string }> {
+  const throttledMs = await waitForGhSlot();
+  const result = await execAsync(command);
+  recordGhCall(type, throttledMs);
+  return result;
+}
+
+function getGhMetricsSnapshot() {
+  pruneGhCallWindow(Date.now());
+  return {
+    total: ghMetrics.total,
+    throttledCount: ghMetrics.throttledCount,
+    throttledMs: ghMetrics.throttledMs,
+    byType: ghMetrics.byType,
+    windowSizeMs: RATE_LIMIT_WINDOW_MS,
+    windowLimit: MAX_GH_CALLS_PER_WINDOW,
+    currentWindowCount: ghCallTimestamps.length,
+  };
+}
+
 async function getNotificationPRs(): Promise<PRNotification[]> {
   log("Fetching notification PRs...");
   try {
-    const { stdout, stderr } = await execAsync(
+    const { stdout, stderr } = await runGhCommand(
+      "notifications",
       `gh api notifications --paginate -q '[.[] | select(.subject.type == "PullRequest")] | .[] | {title: .subject.title, reason: .reason, url: .subject.url}'`
     );
 
@@ -73,7 +157,8 @@ async function getNotificationPRs(): Promise<PRNotification[]> {
         const apiUrl = notification.url;
 
         // Get full PR data in one REST API call
-        const { stdout: prData } = await execAsync(
+        const { stdout: prData } = await runGhCommand(
+          "prDetails",
           `gh api "${apiUrl}" --jq '{state: .state, html_url: .html_url, repository: .base.repo.full_name, number: .number, headRef: .head.ref, closedAt: .closed_at, merged: .merged}'`
         );
 
@@ -135,7 +220,8 @@ async function searchPRsGraphQL(
       }
     `;
 
-    const { stdout, stderr } = await execAsync(
+    const { stdout, stderr } = await runGhCommand(
+      "graphql",
       `gh api graphql -f query='${graphqlQuery}'`
     );
 
@@ -200,7 +286,7 @@ async function searchPRsGraphQL(
 
 async function getUsername(): Promise<string> {
   log("Fetching GitHub username...");
-  const { stdout } = await execAsync(`gh api user --jq '.login'`);
+  const { stdout } = await runGhCommand("user", `gh api user --jq '.login'`);
   const username = stdout.trim();
   log(`GitHub username: ${username}`);
   return username;
@@ -217,6 +303,7 @@ export async function GET() {
       notifications: cachedData.notifications,
       total: cachedData.total,
       cached: true,
+      ghMetrics: getGhMetricsSnapshot(),
     });
   }
 
@@ -314,6 +401,7 @@ export async function GET() {
     const response = NextResponse.json({
       notifications,
       total: notifications.length,
+      ghMetrics: getGhMetricsSnapshot(),
     });
 
     // Resolve all pending requests with the same response
@@ -342,6 +430,7 @@ export async function GET() {
           : "Failed to fetch notifications",
         details: error instanceof Error ? error.message : "Unknown error",
         backoff: isRateLimitError,
+        ghMetrics: getGhMetricsSnapshot(),
       },
       { status: isRateLimitError ? 429 : 500 }
     );

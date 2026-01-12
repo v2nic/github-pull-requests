@@ -10,9 +10,12 @@ services:
     environment:
       - NODE_ENV=production
       - PORT=4477
+      - SOURCE_BASE_PATH=/Users/nicolas/Source
     volumes:
       # Persist GitHub CLI authentication across container restarts
       - gh-config:/home/nextjs/.config/gh
+      # Mount local Source directory at same path as host for worktree access
+      - ~/Source:/Users/nicolas/Source
     restart: unless-stopped
     # Add health check
     healthcheck:
