@@ -110,6 +110,40 @@ The first time you access the app, it will automatically detect that you're not 
 
 Your authentication will persist across container restarts via Docker volumes.
 
+### Windsurf window behavior
+
+If Windsurf opens worktree links in an existing window, set the VS Code-compatible option below in your Windsurf settings:
+
+```json
+{
+  "window.openFoldersInNewWindow": "on"
+}
+```
+
+### Restarting after changes
+
+#### Docker Compose
+
+If you changed application code, rebuild the image and restart the service:
+
+```bash
+docker compose up -d --build
+```
+
+If you only changed environment variables or Docker configuration, restart the container:
+
+```bash
+docker compose restart
+```
+
+#### Local development
+
+Stop the dev server and start it again:
+
+```bash
+npm run dev
+```
+
 ## Configuration
 
 ### Environment Variables

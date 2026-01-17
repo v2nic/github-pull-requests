@@ -97,11 +97,18 @@ export default function Home() {
       { exists: boolean; path: string | null; loading: boolean; error?: string }
     >
   >({});
+  const [worktreeCompareByKey, setWorktreeCompareByKey] = useState<
+    Record<
+      string,
+      { incoming: number; outgoing: number; loading: boolean; error?: string }
+    >
+  >({});
   const pollTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const backoffTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isBackoffRef = useRef(false);
   const circleciInFlightRef = useRef<Set<string>>(new Set());
   const worktreeInFlightRef = useRef<Set<string>>(new Set());
+  const worktreeCompareInFlightRef = useRef<Set<string>>(new Set());
 
   // Debug logging for auth dialog state
   useEffect(() => {
@@ -152,7 +159,7 @@ export default function Home() {
             "API Error received:",
             data.error,
             "Details:",
-            data.details
+            data.details,
           );
           setError(data.error);
           setIsBackoff(!!data.backoff);
@@ -205,7 +212,7 @@ export default function Home() {
                 total: data.total,
                 lastUpdated: now.toISOString(),
                 ghMetrics: data.ghMetrics,
-              })
+              }),
             );
           } catch {}
         }
@@ -216,7 +223,7 @@ export default function Home() {
         setRefreshing(false);
       }
     },
-    [lastUpdated]
+    [lastUpdated],
   );
 
   useEffect(() => {
@@ -260,7 +267,28 @@ export default function Home() {
       }
       return next;
     });
-  }, [notifications, circleciStatusByKey, worktreeStatusByKey]);
+
+    setWorktreeCompareByKey((prev) => {
+      const next: Record<
+        string,
+        { incoming: number; outgoing: number; loading: boolean; error?: string }
+      > = {};
+      for (const key of validKeys) {
+        if (prev[key]) {
+          next[key] = prev[key];
+        }
+      }
+      if (Object.keys(next).length === Object.keys(prev).length) {
+        return prev;
+      }
+      return next;
+    });
+  }, [
+    notifications,
+    circleciStatusByKey,
+    worktreeStatusByKey,
+    worktreeCompareByKey,
+  ]);
 
   useEffect(() => {
     if (loading || error) return;
@@ -274,7 +302,7 @@ export default function Home() {
     if (keys.size === 0) return;
 
     const toFetch = Array.from(keys).filter(
-      (k) => !(k in circleciStatusByKey) && !circleciInFlightRef.current.has(k)
+      (k) => !(k in circleciStatusByKey) && !circleciInFlightRef.current.has(k),
     );
 
     if (toFetch.length === 0) return;
@@ -285,8 +313,8 @@ export default function Home() {
 
       void fetch(
         `/api/circleci/status?repo=${encodeURIComponent(
-          repo ?? ""
-        )}&branch=${encodeURIComponent(branch ?? "")}`
+          repo ?? "",
+        )}&branch=${encodeURIComponent(branch ?? "")}`,
       )
         .then(async (res) => {
           if (!res.ok) {
@@ -326,7 +354,7 @@ export default function Home() {
     if (keys.size === 0) return;
 
     const toFetch = Array.from(keys).filter(
-      (k) => !(k in worktreeStatusByKey) && !worktreeInFlightRef.current.has(k)
+      (k) => !(k in worktreeStatusByKey) && !worktreeInFlightRef.current.has(k),
     );
 
     if (toFetch.length === 0) return;
@@ -337,8 +365,8 @@ export default function Home() {
 
       void fetch(
         `/api/worktree?repo=${encodeURIComponent(
-          repo ?? ""
-        )}&branch=${encodeURIComponent(branch ?? "")}`
+          repo ?? "",
+        )}&branch=${encodeURIComponent(branch ?? "")}`,
       )
         .then(async (res) => {
           if (!res.ok) {
@@ -367,6 +395,86 @@ export default function Home() {
   }, [worktreeStatusByKey, error, loading, notifications]);
 
   useEffect(() => {
+    if (loading || error) return;
+
+    const keys = new Set<string>();
+    for (const n of notifications) {
+      if (!n.repository || !n.headRef) continue;
+      const key = `${n.repository}#${n.headRef}`;
+      if (worktreeStatusByKey[key]?.exists) {
+        keys.add(key);
+      }
+    }
+
+    if (keys.size === 0) return;
+
+    const toFetch = Array.from(keys).filter(
+      (k) =>
+        !(k in worktreeCompareByKey) &&
+        !worktreeCompareInFlightRef.current.has(k),
+    );
+
+    if (toFetch.length === 0) return;
+
+    for (const key of toFetch) {
+      worktreeCompareInFlightRef.current.add(key);
+      setWorktreeCompareByKey((prev) => ({
+        ...prev,
+        [key]: { incoming: 0, outgoing: 0, loading: true },
+      }));
+      const [repo, branch] = key.split("#");
+
+      void fetch(
+        `/api/worktree/compare?repo=${encodeURIComponent(
+          repo ?? "",
+        )}&branch=${encodeURIComponent(branch ?? "")}`,
+      )
+        .then(async (res) => {
+          if (!res.ok) {
+            throw new Error(
+              `Worktree compare request failed with ${res.status}`,
+            );
+          }
+          const data = (await res.json()) as {
+            exists: boolean;
+            incoming?: number;
+            outgoing?: number;
+            error?: string;
+          };
+          setWorktreeCompareByKey((prev) => ({
+            ...prev,
+            [key]: {
+              incoming: data.incoming ?? 0,
+              outgoing: data.outgoing ?? 0,
+              loading: false,
+              error: data.error,
+            },
+          }));
+        })
+        .catch(() => {
+          setWorktreeCompareByKey((prev) => ({
+            ...prev,
+            [key]: {
+              incoming: 0,
+              outgoing: 0,
+              loading: false,
+              error: "Failed to compare worktree",
+            },
+          }));
+        })
+        .finally(() => {
+          worktreeCompareInFlightRef.current.delete(key);
+        });
+    }
+  }, [
+    worktreeCompareByKey,
+    worktreeStatusByKey,
+    error,
+    loading,
+    notifications,
+  ]);
+
+  useEffect(() => {
     let hasCache = false;
 
     try {
@@ -382,7 +490,7 @@ export default function Home() {
         if (Array.isArray(parsed.notifications)) {
           setNotifications(parsed.notifications);
           setLastUpdated(
-            parsed.lastUpdated ? new Date(parsed.lastUpdated) : null
+            parsed.lastUpdated ? new Date(parsed.lastUpdated) : null,
           );
           if (parsed.ghMetrics) {
             setGhMetrics(parsed.ghMetrics);
@@ -578,7 +686,7 @@ export default function Home() {
   const handleCreateWorktree = async (
     repo: string,
     branch: string,
-    key: string
+    key: string,
   ) => {
     setWorktreeStatusByKey((prev) => ({
       ...prev,
@@ -658,8 +766,8 @@ export default function Home() {
                   isBackoff
                     ? "Rate limit exceeded. Please wait before trying again."
                     : isThrottled()
-                    ? "Please wait before refreshing again"
-                    : "Refresh now"
+                      ? "Please wait before refreshing again"
+                      : "Refresh now"
                 }
               >
                 <svg
@@ -759,7 +867,7 @@ export default function Home() {
                         ? n.state === "open"
                         : n.state === "closed" ||
                           n.state === "merged" ||
-                          n.merged
+                          n.merged,
                     ).length
                   }
                 </span>
@@ -848,11 +956,14 @@ export default function Home() {
                                 onClick={(e) => {
                                   e.preventDefault();
                                   e.stopPropagation();
-                                  // Open in Windsurf
                                   if (status.path) {
-                                    window.location.href = `windsurf://file/${encodeURIComponent(
-                                      status.path
-                                    )}`;
+                                    window.open(
+                                      `windsurf://file/${encodeURIComponent(
+                                        status.path,
+                                      )}`,
+                                      "_blank",
+                                      "noopener,noreferrer",
+                                    );
                                   }
                                 }}
                                 className="mr-2 text-gray-500 hover:text-blue-600 dark:text-gray-400 dark:hover:text-blue-400 bg-transparent border-none cursor-pointer p-0"
@@ -883,7 +994,7 @@ export default function Home() {
                                 handleCreateWorktree(
                                   notification.repository!,
                                   notification.headRef!,
-                                  key
+                                  key,
                                 );
                               }}
                               className="mr-2 text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300"
@@ -930,7 +1041,7 @@ export default function Home() {
                             event.preventDefault();
                             event.stopPropagation();
                             await navigator.clipboard.writeText(
-                              notification.headRef ?? ""
+                              notification.headRef ?? "",
                             );
                             setCopyToast(true);
                             setTimeout(() => setCopyToast(false), 2000);
@@ -940,6 +1051,71 @@ export default function Home() {
                           {notification.headRef}
                         </button>
                       )}
+                      {(() => {
+                        const key = `${notification.repository}#${notification.headRef}`;
+                        const compare = worktreeCompareByKey[key];
+                        if (!compare) return null;
+                        if (compare.loading) {
+                          return (
+                            <span
+                              className="inline-flex items-center rounded bg-gray-50 px-1.5 py-0.5 text-gray-300 dark:bg-gray-700/40 dark:text-gray-500"
+                              title="Comparing..."
+                            >
+                              <svg
+                                xmlns="http://www.w3.org/2000/svg"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="2"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                className="h-3.5 w-3.5"
+                              >
+                                <path d="M12 5v10M8 9l4-4 4 4" />
+                                <path d="M12 19V9M8 15l4 4 4-4" />
+                              </svg>
+                            </span>
+                          );
+                        }
+                        const incoming = compare.incoming ?? 0;
+                        const outgoing = compare.outgoing ?? 0;
+                        const titleParts = [];
+                        if (incoming > 0)
+                          titleParts.push(`Incoming ${incoming}`);
+                        if (outgoing > 0)
+                          titleParts.push(`Outgoing ${outgoing}`);
+                        if (incoming === 0 && outgoing === 0) {
+                          titleParts.push("No incoming or outgoing changes");
+                        }
+                        return (
+                          <span
+                            className={`inline-flex items-center rounded px-1.5 py-0.5 ${
+                              incoming === 0 && outgoing === 0
+                                ? "bg-gray-50 text-gray-400 dark:bg-gray-700/40 dark:text-gray-500"
+                                : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-200"
+                            }`}
+                            title={titleParts.join(" · ")}
+                          >
+                            <svg
+                              xmlns="http://www.w3.org/2000/svg"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              className="h-3.5 w-3.5"
+                            >
+                              {outgoing > 0 && (
+                                <path d="M12 5v10M8 9l4-4 4 4" />
+                              )}
+                              {incoming > 0 && (
+                                <path d="M12 19V9M8 15l4 4 4-4" />
+                              )}
+                            </svg>
+                          </span>
+                        );
+                      })()}
                       {notification.repository && notification.headRef && (
                         <button
                           type="button"
@@ -951,12 +1127,12 @@ export default function Home() {
                               circleciStatusByKey[key]?.pipelineUrl ??
                               getCircleciPipelineUrl(
                                 notification.repository ?? "",
-                                notification.headRef ?? ""
+                                notification.headRef ?? "",
                               );
                             window.open(
                               pipelineUrl,
                               "_blank",
-                              "noopener,noreferrer"
+                              "noopener,noreferrer",
                             );
                           }}
                           className="inline-flex items-center gap-1 rounded bg-gray-100 px-1.5 py-0.5 text-gray-700 hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-200 dark:hover:bg-gray-600"
@@ -1003,7 +1179,7 @@ export default function Home() {
                   <span
                     className={`rounded-full px-2.5 py-0.5 text-xs font-medium ${getStateColor(
                       notification.state,
-                      notification.merged
+                      notification.merged,
                     )}`}
                   >
                     {notification.merged
