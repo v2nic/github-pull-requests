@@ -6,6 +6,11 @@ import * as path from "path";
 
 const execAsync = promisify(exec);
 
+type WorktreeEntry = {
+  path: string;
+  branch: string | null;
+};
+
 function getSourceDir() {
   // Use the same path for both container and host since volume is mounted at same location
   return process.env.SOURCE_BASE_PATH || "/Users/nicolas/Source";
@@ -19,7 +24,7 @@ function getRepoPath(repoFullName: string) {
 // Logic from wta bash function
 async function getWorktreePath(
   repoPath: string,
-  branch: string
+  branch: string,
 ): Promise<{ worktreePath: string; gitCmd: string[] }> {
   // Check if repoPath exists
   if (!fs.existsSync(repoPath)) {
@@ -37,7 +42,7 @@ async function getWorktreePath(
   try {
     const { stdout: repoRootOut } = await execAsync(
       "git rev-parse --show-toplevel",
-      { cwd: repoPath }
+      { cwd: repoPath },
     );
     repoRoot = repoRootOut.trim();
   } catch {
@@ -55,9 +60,82 @@ async function getWorktreePath(
   const worktreePath = path.join(repoDir, branch);
 
   // Git command
-  const gitCmd = repoRoot ? ["git"] : ["git", `--git-dir=${gitDir}`];
+  const gitCmd = repoRoot ? ["git"] : ["git", `--git-dir=${resolvedGitDir}`];
 
   return { worktreePath, gitCmd };
+}
+
+function parseWorktreeList(output: string): WorktreeEntry[] {
+  const entries: WorktreeEntry[] = [];
+  let current: WorktreeEntry | null = null;
+
+  const flush = () => {
+    if (current?.path) {
+      entries.push(current);
+    }
+    current = null;
+  };
+
+  for (const rawLine of output.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) {
+      flush();
+      continue;
+    }
+
+    if (line.startsWith("worktree ")) {
+      flush();
+      current = { path: line.replace("worktree ", "").trim(), branch: null };
+      continue;
+    }
+
+    if (line.startsWith("branch ")) {
+      if (!current) {
+        current = { path: "", branch: null };
+      }
+      current.branch = line.replace("branch ", "").trim();
+    }
+  }
+
+  flush();
+
+  return entries;
+}
+
+function normalizeBranchRef(ref: string | null): string | null {
+  if (!ref) return null;
+  if (ref.startsWith("refs/heads/")) {
+    return ref.replace("refs/heads/", "");
+  }
+  if (ref.startsWith("refs/remotes/origin/")) {
+    return ref.replace("refs/remotes/origin/", "");
+  }
+  return ref;
+}
+
+async function findExistingWorktreePath(
+  repoPath: string,
+  branch: string,
+  gitCmd: string[],
+): Promise<string | null> {
+  try {
+    const baseGitCmd = gitCmd.join(" ");
+    const { stdout } = await execAsync(
+      `${baseGitCmd} worktree list --porcelain`,
+      { cwd: repoPath },
+    );
+    const entries = parseWorktreeList(stdout);
+    for (const entry of entries) {
+      const normalizedBranch = normalizeBranchRef(entry.branch);
+      if (normalizedBranch === branch) {
+        return entry.path;
+      }
+    }
+  } catch (error) {
+    console.error("Error reading worktree list:", error);
+  }
+
+  return null;
 }
 
 export async function GET(request: Request) {
@@ -68,7 +146,7 @@ export async function GET(request: Request) {
   if (!repo || !branch) {
     return NextResponse.json(
       { error: "Missing repo or branch" },
-      { status: 400 }
+      { status: 400 },
     );
   }
 
@@ -82,14 +160,19 @@ export async function GET(request: Request) {
       });
     }
 
-    const { worktreePath } = await getWorktreePath(repoPath, branch);
+    const { worktreePath, gitCmd } = await getWorktreePath(repoPath, branch);
+    const existingWorktreePath = await findExistingWorktreePath(
+      repoPath,
+      branch,
+      gitCmd,
+    );
 
     // Check if worktree exists
-    const exists = fs.existsSync(worktreePath);
+    const exists = Boolean(existingWorktreePath) || fs.existsSync(worktreePath);
 
     return NextResponse.json({
       exists,
-      path: worktreePath, // Same path for both operations and display
+      path: existingWorktreePath ?? worktreePath, // Same path for both operations and display
     });
   } catch (error) {
     console.error("Error checking worktree:", error);
@@ -104,17 +187,22 @@ export async function POST(request: Request) {
     if (!repo || !branch) {
       return NextResponse.json(
         { error: "Missing repo or branch" },
-        { status: 400 }
+        { status: 400 },
       );
     }
 
     const repoPath = getRepoPath(repo);
     const { worktreePath, gitCmd } = await getWorktreePath(repoPath, branch);
+    const existingWorktreePath = await findExistingWorktreePath(
+      repoPath,
+      branch,
+      gitCmd,
+    );
 
-    if (fs.existsSync(worktreePath)) {
+    if (existingWorktreePath || fs.existsSync(worktreePath)) {
       return NextResponse.json({
         success: true,
-        path: worktreePath, // Same path for both operations and display
+        path: existingWorktreePath ?? worktreePath, // Same path for both operations and display
         message: "Worktree already exists",
       });
     }
@@ -137,13 +225,13 @@ export async function POST(request: Request) {
     };
 
     const hasLocalBranch = await runGit(
-      `show-ref --verify --quiet "refs/heads/${branch}"`
+      `show-ref --verify --quiet "refs/heads/${branch}"`,
     )
       .then(() => true)
       .catch(() => false);
 
     const hasRemoteBranch = await runGit(
-      `show-ref --verify --quiet "refs/remotes/origin/${branch}"`
+      `show-ref --verify --quiet "refs/remotes/origin/${branch}"`,
     )
       .then(() => true)
       .catch(() => false);
@@ -164,7 +252,7 @@ export async function POST(request: Request) {
     console.error("Error creating worktree:", error);
     return NextResponse.json(
       { error: error instanceof Error ? error.message : String(error) },
-      { status: 500 }
+      { status: 500 },
     );
   }
 }
